@@ -11,11 +11,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 from notifier import (
-    build_full_prompt_txt,
-    build_gemini_research_prompt,
+    build_clean_prompt_txt,
     build_morning_embeds,
     build_prerace_embed,
-    send_discord_text,
     send_discord_webhook,
 )
 from rules import AlertDecision, evaluate_entry
@@ -25,7 +23,6 @@ from scraper import (
     fetch_horse_history,
     fetch_live_odds,
     fetch_mirai_entry_from_shutuba,
-    fetch_race_card_for_prompt,
 )
 
 JST = timezone(timedelta(hours=9))
@@ -178,31 +175,16 @@ def run_pre_race(
                 f"岩田望来：{entry.umaban}番 **{entry.horse_name}**"
             )
             embed = build_prerace_embed(decision, minutes_left=mins if (mins is not None and mins > 0) else None)
-            send_discord_webhook(webhook_url, content, [embed], dry_run=dry_run)
-            time.sleep(0.5)
-
-            # Follow up with:
-            # 1) 1-tap copyable data block (for custom Gem with master instructions already saved)
-            # 2) Full self-contained .txt prompt attachment (for normal Gemini chat / Antigravity)
-            try:
-                runners = fetch_race_card_for_prompt(entry.race_id, odds_map)
-                if runners:
-                    gem_body = build_gemini_research_prompt(decision, runners, max_chars=1880)
-                    full_txt = build_full_prompt_txt(decision, runners)
-                    filename = f"prompt_{entry.date}_{entry.venue}{entry.race_num}R.txt"
-                    prompt_msg = (
-                        "📋 **専用Gem（Neon Extra）コピペ用データ**（通常チャット用フルプロンプト `.txt` 添付済み）\n"
-                        f"```text\n{gem_body}\n```"
-                    )
-                    send_discord_text(
-                        webhook_url,
-                        prompt_msg,
-                        dry_run=dry_run,
-                        attachment_filename=filename,
-                        attachment_text=full_txt,
-                    )
-            except Exception as exc:
-                print(f"  [warn] Failed to build/send Gemini prompt for {entry.race_id}: {exc}")
+            prompt_txt = build_clean_prompt_txt(decision)
+            filename = f"prompt_{entry.date}_{entry.venue}{entry.race_num}R.txt"
+            send_discord_webhook(
+                webhook_url,
+                content,
+                [embed],
+                dry_run=dry_run,
+                attachment_filename=filename,
+                attachment_text=prompt_txt,
+            )
 
             sent_ids.add(s.race_id)
             alerts_sent += 1

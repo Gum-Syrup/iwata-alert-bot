@@ -1,4 +1,4 @@
-"""Discord Webhook notifier with @everyone mention and rich embeds."""
+"""Discord Webhook notifier with @everyone mention, clean embeds, and .txt prompt attachment."""
 
 from __future__ import annotations
 
@@ -7,22 +7,8 @@ import urllib.request
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-from prompt_template import GEM_MASTER_INSTRUCTIONS
+from prompt_template import USER_MASTER_PROMPT_TEMPLATE
 from rules import AlertDecision
-from scraper import RivalHorse
-
-VENUE_SHORT = {
-    "札幌": "札",
-    "函館": "函",
-    "福島": "福",
-    "新潟": "新",
-    "東京": "東",
-    "中山": "中",
-    "中京": "名",
-    "京都": "京",
-    "阪神": "阪",
-    "小倉": "小",
-}
 
 COLOR_RANK_S = 0xE74C3C  # Crimson / Hot S-rank
 COLOR_RANK_A = 0x2ECC71  # Emerald / Solid A-rank
@@ -113,7 +99,7 @@ def build_morning_embeds(
         content = (
             f"@everyone ☀️ **{date_fmt} 岩田望来 朝イチ狙い目まとめ**\n"
             f"本日の条件合致：**{len(targets)}レース**（全{len(all_decisions)}鞍中）"
-            "｜各レース発走1時間前に最新オッズ＋Gemini貼るだけプロンプトを送ります！"
+            "｜各レース発走1時間前に最新オッズ＋リサーチ用 `.txt` 付きで通知します！"
         )
     else:
         content = (
@@ -124,7 +110,6 @@ def build_morning_embeds(
 
     embeds: List[Dict[str, Any]] = []
 
-    # Compact overview embed
     overview_lines: List[str] = []
     for d in all_decisions:
         e = d.entry
@@ -149,11 +134,9 @@ def build_morning_embeds(
         }
     )
 
-    # Detailed embeds for target races (up to 9 so total <= 10 embeds)
     for d in targets[:9]:
         embeds.append(build_prerace_embed(d))
 
-    # Optional watch note if there are morning watch candidates
     if watches and len(embeds) < 10:
         w_lines = []
         for d in watches:
@@ -173,158 +156,17 @@ def build_morning_embeds(
     return content, embeds
 
 
-def _format_step1_and_step2_data(
-    decision: AlertDecision,
-    runners: List[RivalHorse],
-    max_runs: int,
-    include_agari: bool,
-) -> str:
+def build_clean_prompt_txt(decision: AlertDecision) -> str:
+    """Build the user's exact unmodified ROI-600% prompt with the target race name filled in."""
     e = decision.entry
-    date_fmt = f"{e.date[:4]}/{e.date[4:6]}/{e.date[6:8]}"
+    date_fmt = f"{e.date[:4]}年{int(e.date[4:6])}月{int(e.date[6:8])}日"
     surf_name = "ダート" if e.surface == "ダ" else "芝"
     baba_str = e.baba or "未発表"
-    rank_label = "Sランク" if decision.rank == "S" else "Aランク"
-    short_boosts = " / ".join(b.split("（")[0] for b in decision.boosts[:5])
-
-    header = (
-        f"【対象レース：{date_fmt} {e.venue}{e.race_num}R {e.race_name}】\n"
-        f"条件：{surf_name}{e.distance}m({baba_str}) / {e.race_class} / {e.field_size}頭 / {e.post_time}発走\n"
-        f"出馬表：{e.shutuba_url}\n"
-        f"【岩田望来Bot判定（Step 2以降で優先検討）】{rank_label}：{e.umaban}番 {e.horse_name}（{decision.pillar}｜{short_boosts}）\n\n"
-        "■Step 1用：全出走馬データ（オッズ伏せ｜枠-馬番 馬名 性齢/騎手/斤量/脚質｜近走）\n"
+    race_header = (
+        f"{date_fmt} {e.venue}{e.race_num}R {e.race_name}"
+        f"（{surf_name}{e.distance}m・{baba_str}・{e.post_time}発走）"
     )
-
-    step1_lines: List[str] = []
-    odds_parts: List[str] = []
-    for r in runners:
-        st_s = f"/{r.style}" if r.style else ""
-        wt_s = r.kinryo.rstrip("0").rstrip(".") if r.kinryo else ""
-        meta = f"{r.sex_age}/{r.jockey}/{wt_s}{st_s}"
-        runs_s = []
-        for pr in r.past_runs[:max_runs]:
-            v = VENUE_SHORT.get(pr.venue, pr.venue[:1])
-            d = f"{pr.surface}{pr.distance // 100}" if pr.distance else ""
-            rk = f"{pr.rank}着" if pr.rank.isdigit() else pr.rank
-            mg = f"({pr.margin})" if pr.margin else ""
-            extras = []
-            if pr.tsuka:
-                extras.append(pr.tsuka)
-            if include_agari and pr.agari:
-                extras.append(f"上{pr.agari}")
-            ex_s = f"[{'/'.join(extras)}]" if extras else ""
-            runs_s.append(f"{v}{d}{pr.baba}{rk}{mg}{ex_s}")
-        past_txt = " ".join(runs_s) if runs_s else "初出走"
-        step1_lines.append(f"{r.waku}-{r.umaban} {r.horse_name}({meta}) {past_txt}")
-
-        if r.popularity and r.odds:
-            mark = "★" if r.umaban == e.umaban else ""
-            odds_parts.append(f"{mark}{r.umaban}番:{r.popularity}人({r.odds:.1f})")
-
-    step2_block = (
-        "\n\n■Step 2用：直前単勝オッズ（Step 1完了後に参照｜★＝岩田望来）\n"
-        + (" / ".join(odds_parts) if odds_parts else "オッズ未確定（Web検索で確認）")
-    )
-    return header + "\n".join(step1_lines) + step2_block
-
-
-def build_gemini_research_prompt(
-    decision: AlertDecision,
-    runners: List[RivalHorse],
-    max_chars: int = 1900,
-) -> str:
-    """Build a 1-tap copy-paste data block for the user's custom Gem (always fits in 1 Discord block)."""
-    for max_runs, inc_agari in ((3, True), (3, False), (2, True), (2, False), (1, False)):
-        candidate = _format_step1_and_step2_data(decision, runners, max_runs, inc_agari)
-        if len(candidate) <= max_chars:
-            return candidate
-    return _format_step1_and_step2_data(decision, runners, 1, False)[:max_chars]
-
-
-def build_full_prompt_txt(
-    decision: AlertDecision,
-    runners: List[RivalHorse],
-) -> str:
-    """Build the complete self-contained full prompt (.txt attachment) with all 3 past runs + agari."""
-    data_block = _format_step1_and_step2_data(decision, runners, max_runs=3, include_agari=True)
-    return (
-        GEM_MASTER_INSTRUCTIONS.strip()
-        + "\n\n"
-        + "=" * 60
-        + "\n# 今回分析する対象レースデータ\n"
-        + "=" * 60
-        + "\n"
-        + data_block
-        + "\n"
-    )
-
-
-def send_discord_text(
-    webhook_url: str,
-    content: str,
-    dry_run: bool = False,
-    attachment_filename: Optional[str] = None,
-    attachment_text: Optional[str] = None,
-) -> None:
-    """Send a plain-text / code-block message (optionally with a .txt file attachment) to Discord."""
-    if dry_run:
-        print("-" * 72)
-        print(f"[DRY-RUN GEM COPY-PASTE BLOCK] (len={len(content)})")
-        print(content)
-        if attachment_filename and attachment_text:
-            print(f"[DRY-RUN ATTACHMENT] {attachment_filename} ({len(attachment_text)} chars)")
-        print("-" * 72)
-        return
-
-    if not webhook_url:
-        raise ValueError("DISCORD_WEBHOOK_URL is not set.")
-
-    payload = {
-        "content": content[:2000],
-        "allowed_mentions": {"parse": []},
-    }
-
-    if attachment_filename and attachment_text is not None:
-        boundary = f"----IwataBotBoundary{uuid.uuid4().hex}"
-        parts: List[bytes] = []
-        # payload_json part
-        parts.append(
-            (
-                f"--{boundary}\r\n"
-                'Content-Disposition: form-data; name="payload_json"\r\n'
-                "Content-Type: application/json; charset=utf-8\r\n\r\n"
-                f"{json.dumps(payload, ensure_ascii=False)}\r\n"
-            ).encode("utf-8")
-        )
-        # file part
-        file_bytes = attachment_text.encode("utf-8")
-        parts.append(
-            (
-                f"--{boundary}\r\n"
-                f'Content-Disposition: form-data; name="files[0]"; filename="{attachment_filename}"\r\n'
-                "Content-Type: text/plain; charset=utf-8\r\n\r\n"
-            ).encode("utf-8")
-            + file_bytes
-            + b"\r\n"
-        )
-        parts.append(f"--{boundary}--\r\n".encode("utf-8"))
-        body = b"".join(parts)
-        content_type = f"multipart/form-data; boundary={boundary}"
-    else:
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        content_type = "application/json"
-
-    req = urllib.request.Request(
-        webhook_url,
-        data=body,
-        headers={
-            "Content-Type": content_type,
-            "User-Agent": "iwata-alert-bot/1.0",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=25) as resp:
-        if resp.status not in (200, 204):
-            raise RuntimeError(f"Discord webhook returned HTTP {resp.status}")
+    return USER_MASTER_PROMPT_TEMPLATE.format(race_header=race_header).strip() + "\n"
 
 
 def send_discord_webhook(
@@ -332,6 +174,8 @@ def send_discord_webhook(
     content: str,
     embeds: List[Dict[str, Any]],
     dry_run: bool = False,
+    attachment_filename: Optional[str] = None,
+    attachment_text: Optional[str] = None,
 ) -> None:
     if dry_run:
         print("=" * 72)
@@ -344,13 +188,15 @@ def send_discord_webhook(
             print(emb.get("description", ""))
             for fld in emb.get("fields", []):
                 print(f"[{fld['name']}]\n{fld['value']}")
+        if attachment_filename and attachment_text is not None:
+            print(f"\n[ATTACHMENT] {attachment_filename} ({len(attachment_text)} chars)")
+            print(attachment_text[:260] + "...")
         print("=" * 72)
         return
 
     if not webhook_url:
         raise ValueError("DISCORD_WEBHOOK_URL is not set.")
 
-    # Discord allows max 10 embeds per webhook request
     chunk_size = 10
     for i in range(0, max(1, len(embeds)), chunk_size):
         chunk = embeds[i : i + chunk_size]
@@ -359,16 +205,40 @@ def send_discord_webhook(
             "embeds": chunk,
             "allowed_mentions": {"parse": ["everyone"]},
         }
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+        if i == 0 and attachment_filename and attachment_text is not None:
+            boundary = f"----IwataBotBoundary{uuid.uuid4().hex}"
+            parts: List[bytes] = [
+                (
+                    f"--{boundary}\r\n"
+                    'Content-Disposition: form-data; name="payload_json"\r\n'
+                    "Content-Type: application/json; charset=utf-8\r\n\r\n"
+                    f"{json.dumps(payload, ensure_ascii=False)}\r\n"
+                ).encode("utf-8"),
+                (
+                    f"--{boundary}\r\n"
+                    f'Content-Disposition: form-data; name="files[0]"; filename="{attachment_filename}"\r\n'
+                    "Content-Type: text/plain; charset=utf-8\r\n\r\n"
+                ).encode("utf-8")
+                + attachment_text.encode("utf-8")
+                + b"\r\n",
+                f"--{boundary}--\r\n".encode("utf-8"),
+            ]
+            body = b"".join(parts)
+            content_type = f"multipart/form-data; boundary={boundary}"
+        else:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            content_type = "application/json"
+
         req = urllib.request.Request(
             webhook_url,
             data=body,
             headers={
-                "Content-Type": "application/json",
+                "Content-Type": content_type,
                 "User-Agent": "iwata-alert-bot/1.0",
             },
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=25) as resp:
             if resp.status not in (200, 204):
                 raise RuntimeError(f"Discord webhook returned HTTP {resp.status}")
