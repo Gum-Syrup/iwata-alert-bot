@@ -1,0 +1,42 @@
+name: Morning Alert (岩田望来 朝イチまとめ)
+
+on:
+  schedule:
+    # 毎日 08:15 JST (= 23:15 UTC) — 開催日・騎乗日以外は自動スキップ
+    - cron: "15 23 * * *"
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "検証用の開催日 YYYYMMDD（空欄なら本日のJST）"
+        required: false
+        default: ""
+      dry_run:
+        description: "Discordへ送らずログ出力のみでテスト"
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  morning-alert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run morning alert
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          ARGS="--mode morning"
+          if [ -n "${{ inputs.date }}" ]; then
+            ARGS="$ARGS --date ${{ inputs.date }}"
+          fi
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          python bot.py $ARGS

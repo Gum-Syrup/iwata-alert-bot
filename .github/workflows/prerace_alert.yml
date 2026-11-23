@@ -1,0 +1,95 @@
+name: Pre-Race Alert (岩田望来 出走1時間前通知)
+
+on:
+  schedule:
+    # 毎日 08:52〜17:52 JST の15分おき（毎時 :07, :22, :37, :52）
+    # 開催日以外は1秒で自動終了。夏の暑熱対策レース・祝日開催にも自動対応。
+    - cron: "52 23 * * *"
+    - cron: "7,22,37,52 0-8 * * *"
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "検証用の開催日 YYYYMMDD（空欄なら本日のJST）"
+        required: false
+        default: ""
+      force_all:
+        description: "時間窓を無視して当日全レースを判定（テスト用）"
+        type: boolean
+        required: false
+        default: false
+      dry_run:
+        description: "Discordへ送らずログ出力のみでテスト"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: iwata-prerace-alert
+  cancel-in-progress: false
+
+jobs:
+  prerace-alert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve target JST date
+        id: jst
+        run: |
+          if [ -n "${{ inputs.date }}" ]; then
+            echo "date=${{ inputs.date }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "date=$(TZ=Asia/Tokyo date +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore sent-state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .state
+          key: sent-state-${{ steps.jst.outputs.date }}-${{ github.run_id }}
+          restore-keys: |
+            sent-state-${{ steps.jst.outputs.date }}-
+
+      - name: Run pre-race alert (45-75 min before post)
+        id: run_bot
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          STATE_FILE=".state/sent_${{ steps.jst.outputs.date }}.json"
+          BEFORE_HASH=""
+          if [ -f "$STATE_FILE" ]; then
+            BEFORE_HASH=$(sha256sum "$STATE_FILE" | awk '{print $1}')
+          fi
+
+          ARGS="--mode pre_race --date ${{ steps.jst.outputs.date }} --state-dir .state --window-min 45 --window-max 75"
+          if [ "${{ inputs.force_all }}" = "true" ]; then
+            ARGS="$ARGS --force-all"
+          fi
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          python bot.py $ARGS
+
+          AFTER_HASH=""
+          if [ -f "$STATE_FILE" ]; then
+            AFTER_HASH=$(sha256sum "$STATE_FILE" | awk '{print $1}')
+          fi
+
+          if [ -n "$AFTER_HASH" ] && [ "$BEFORE_HASH" != "$AFTER_HASH" ]; then
+            echo "state_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "state_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save updated sent-state cache
+        if: steps.run_bot.outputs.state_changed == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .state
+          key: sent-state-${{ steps.jst.outputs.date }}-${{ github.run_id }}
