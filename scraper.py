@@ -414,6 +414,134 @@ def fetch_live_odds(race_id: str) -> Tuple[Dict[int, Tuple[float, int]], str]:
     return {}, ""
 
 
+@dataclass
+class PastRun:
+    venue: str
+    surface: str
+    distance: int
+    baba: str
+    rank: str
+    margin: str
+    tsuka: str
+    agari: str
+
+
+@dataclass
+class RivalHorse:
+    waku: int
+    umaban: int
+    horse_name: str
+    sex_age: str
+    jockey: str
+    kinryo: str
+    style: str
+    trainer: str
+    odds: Optional[float] = None
+    popularity: Optional[int] = None
+    past_runs: List[PastRun] = field(default_factory=list)
+
+
+def fetch_race_card_for_prompt(
+    race_id: str,
+    odds_map: Dict[int, Tuple[float, int]],
+) -> List[RivalHorse]:
+    """Fetch all runners + recent past runs in 1 request from shutuba_past.html."""
+    url = f"https://race.netkeiba.com/race/shutuba_past.html?race_id={race_id}"
+    text = _decode_jp(_http_get(url))
+
+    rows = re.findall(r'<tr[^>]*class="HorseList[^"]*"[^>]*>(.*?)</tr>', text, re.S)
+    runners: List[RivalHorse] = []
+
+    for row in rows:
+        if "Cancel" in row or "取消" in row or "除外" in row:
+            continue
+        tds = re.findall(r"<td[^>]*>(.*?)</td>", row, re.S)
+        if len(tds) < 6:
+            continue
+
+        waku_s = _strip_tags(tds[0])
+        uma_s = _strip_tags(tds[1])
+        if not (waku_s.isdigit() and uma_s.isdigit()):
+            continue
+
+        waku = int(waku_s)
+        umaban = int(uma_s)
+
+        # Horse name, trainer, running style from TD[3]
+        h2_m = re.search(r'class="Horse02"[^>]*>(.*?)</div>', tds[3], re.S)
+        horse_name = _strip_tags(h2_m.group(1)) if h2_m else ""
+        td3_txt = _strip_tags(tds[3])
+        tr_m = re.search(r"(美浦・\S+|栗東・\S+|地方・\S+|海外・\S+)", td3_txt)
+        trainer = tr_m.group(1) if tr_m else ""
+        st_m = re.search(r"(?:美浦・\S+|栗東・\S+|地方・\S+|海外・\S+)\s+(逃|先|差|追|マ)", td3_txt)
+        style = st_m.group(1) if st_m else ""
+
+        # Sex/age, jockey, weight from TD[4]
+        td4_txt = _strip_tags(tds[4])
+        sa_m = re.search(r"([牡牝セ]\d+)", td4_txt)
+        sex_age = sa_m.group(1) if sa_m else ""
+        jk_m = re.search(r"<a[^>]*jockey/(?:result/recent/)?\d+/?[^>]*>(.*?)</a>", tds[4], re.S)
+        jockey = _strip_tags(jk_m.group(1)) if jk_m else ""
+        wt_m = re.search(r"(\d{2}\.\d)", td4_txt)
+        kinryo = wt_m.group(1) if wt_m else ""
+
+        # Parse up to 3 actual past runs from TD[5:] (skipping layoff divider cells)
+        past_runs: List[PastRun] = []
+        for cell in tds[5:]:
+            c_txt = _strip_tags(cell)
+            if not re.match(r"^\d{4}\.\d{2}\.\d{2}\s+", c_txt):
+                continue
+            # Format: "2026.08.29 札幌 5 千歳特別 2勝 ダ1700 1:44.7 稍 12頭 9番 3人 武豊 53.0 2-2-2-1 (37.1) 480(0) 馬名 (0.6)"
+            m_head = re.match(r"^\d{4}\.\d{2}\.\d{2}\s+(\S+)\s+(\S+)", c_txt)
+            p_venue = m_head.group(1) if m_head else ""
+            p_rank = m_head.group(2) if m_head else ""
+            m_dist = re.search(r"(芝|ダ|障)(\d+)", c_txt)
+            p_surf = m_dist.group(1) if m_dist else ""
+            p_dist = int(m_dist.group(2)) if m_dist else 0
+            m_baba = re.search(r"[\d:.]+\s+(良|稍|重|不)\b", c_txt)
+            p_baba = m_baba.group(1) if m_baba else ""
+            m_tsuka = re.search(r"(\d+(?:-\d+)+)\s+\(([\d.]+)\)", c_txt)
+            p_tsuka = m_tsuka.group(1) if m_tsuka else ""
+            p_agari = m_tsuka.group(2) if m_tsuka else ""
+            m_margin = re.search(r"\(([+-]?\d+\.\d+)\)\s*$", c_txt)
+            p_margin = m_margin.group(1) if m_margin else ""
+
+            past_runs.append(
+                PastRun(
+                    venue=p_venue,
+                    surface=p_surf,
+                    distance=p_dist,
+                    baba=p_baba,
+                    rank=p_rank,
+                    margin=p_margin,
+                    tsuka=p_tsuka,
+                    agari=p_agari,
+                )
+            )
+            if len(past_runs) >= 3:
+                break
+
+        odd_val, pop_val = odds_map.get(umaban, (None, None))
+        runners.append(
+            RivalHorse(
+                waku=waku,
+                umaban=umaban,
+                horse_name=horse_name,
+                sex_age=sex_age,
+                jockey=jockey,
+                kinryo=kinryo,
+                style=style,
+                trainer=trainer,
+                odds=odd_val,
+                popularity=pop_val,
+                past_runs=past_runs,
+            )
+        )
+
+    runners.sort(key=lambda r: r.umaban)
+    return runners
+
+
 def fetch_horse_history(horse_id: str, venue: str, date_yyyymmdd: str) -> HorseHistory:
     """Fetch complete pre-race history for one horse from db.netkeiba.com/horse/result/{id}/."""
     if not horse_id:

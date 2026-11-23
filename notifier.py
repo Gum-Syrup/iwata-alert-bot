@@ -7,6 +7,20 @@ import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
 from rules import AlertDecision
+from scraper import RivalHorse
+
+VENUE_SHORT = {
+    "札幌": "札",
+    "函館": "函",
+    "福島": "福",
+    "新潟": "新",
+    "東京": "東",
+    "中山": "中",
+    "中京": "名",
+    "京都": "京",
+    "阪神": "阪",
+    "小倉": "小",
+}
 
 COLOR_RANK_S = 0xE74C3C  # Crimson / Hot S-rank
 COLOR_RANK_A = 0x2ECC71  # Emerald / Solid A-rank
@@ -97,7 +111,7 @@ def build_morning_embeds(
         content = (
             f"@everyone ☀️ **{date_fmt} 岩田望来 朝イチ狙い目まとめ**\n"
             f"本日の条件合致：**{len(targets)}レース**（全{len(all_decisions)}鞍中）"
-            "｜各レース発走1時間前にも最新オッズで再通知します！"
+            "｜各レース発走1時間前に最新オッズ＋Gemini貼るだけプロンプトを送ります！"
         )
     else:
         content = (
@@ -155,6 +169,99 @@ def build_morning_embeds(
         )
 
     return content, embeds
+
+
+def build_gemini_research_prompt(
+    decision: AlertDecision,
+    runners: List[RivalHorse],
+    max_chars: int = 1920,
+) -> str:
+    """Build a 1-tap copy-paste prompt for Gemini (Neon Extra) that ALWAYS fits in 1 Discord message."""
+    e = decision.entry
+    date_fmt = f"{e.date[:4]}/{e.date[4:6]}/{e.date[6:8]}"
+    surf_name = "ダート" if e.surface == "ダ" else "芝"
+    baba_str = e.baba or "未発表"
+    odds_str = f"{e.popularity}人気/{e.odds:.1f}倍" if (e.popularity and e.odds) else "未確定"
+    rank_label = "Sランク" if decision.rank == "S" else "Aランク"
+    short_boosts = " / ".join(b.split("（")[0] for b in decision.boosts[:5])
+
+    header = (
+        f"以下のJRAレースで岩田望来騎乗【{e.umaban}番 {e.horse_name}（{odds_str}）】を軸に馬券を組みます。\n"
+        "Web検索で当日の馬場傾向・調教・直前情報も補完しつつ、展開予想と望来の相手馬"
+        "（○対抗・▲単穴・△連下2〜3頭・☆穴1頭）を根拠つきで厳選し、馬連・ワイド・3連複の買い目案を簡潔に出してください。\n\n"
+        f"■レース：{date_fmt} {e.venue}{e.race_num}R {e.race_name} {surf_name}{e.distance}m({baba_str}) {e.race_class} {e.field_size}頭 {e.post_time}発走\n"
+        f"■望来判定：{rank_label}（{decision.pillar}｜{short_boosts}）\n"
+        f"■出馬表：{e.shutuba_url}\n"
+        "■全出走馬（馬番 馬名 性齢/騎手/斤量/人気・単勝/脚質｜近走）\n"
+    )
+
+    def _format_runners(max_runs: int, include_agari: bool) -> str:
+        lines: List[str] = []
+        for r in runners:
+            mark = "★" if r.umaban == e.umaban else ""
+            op_s = f"{r.popularity}人{r.odds:.1f}" if (r.popularity and r.odds) else "-"
+            st_s = f"/{r.style}" if r.style else ""
+            wt_s = r.kinryo.rstrip("0").rstrip(".") if r.kinryo else ""
+            meta = f"{r.sex_age}/{r.jockey}/{wt_s}/{op_s}{st_s}"
+            runs_s = []
+            for pr in r.past_runs[:max_runs]:
+                v = VENUE_SHORT.get(pr.venue, pr.venue[:1])
+                d = f"{pr.surface}{pr.distance // 100}" if pr.distance else ""
+                rk = f"{pr.rank}着" if pr.rank.isdigit() else pr.rank
+                mg = f"({pr.margin})" if pr.margin else ""
+                extras = []
+                if pr.tsuka:
+                    extras.append(pr.tsuka)
+                if include_agari and pr.agari:
+                    extras.append(f"上{pr.agari}")
+                ex_s = f"[{'/'.join(extras)}]" if extras else ""
+                runs_s.append(f"{v}{d}{pr.baba}{rk}{mg}{ex_s}")
+            past_txt = " ".join(runs_s) if runs_s else "初出走"
+            lines.append(f"{mark}{r.umaban} {r.horse_name}({meta}) {past_txt}")
+        return header + "\n".join(lines)
+
+    # Progressively tighten detail if field is large so it NEVER exceeds Discord's 2000-char limit
+    for max_runs, inc_agari in ((3, True), (3, False), (2, True), (2, False), (1, False)):
+        candidate = _format_runners(max_runs, inc_agari)
+        if len(candidate) <= max_chars:
+            return candidate
+
+    return _format_runners(1, False)[:max_chars]
+
+
+def send_discord_text(
+    webhook_url: str,
+    content: str,
+    dry_run: bool = False,
+) -> None:
+    """Send a plain-text / code-block message (no @everyone) to Discord."""
+    if dry_run:
+        print("-" * 72)
+        print(f"[DRY-RUN COPY-PASTE PROMPT] (len={len(content)})")
+        print(content)
+        print("-" * 72)
+        return
+
+    if not webhook_url:
+        raise ValueError("DISCORD_WEBHOOK_URL is not set.")
+
+    payload = {
+        "content": content[:2000],
+        "allowed_mentions": {"parse": []},
+    }
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        webhook_url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "iwata-alert-bot/1.0",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        if resp.status not in (200, 204):
+            raise RuntimeError(f"Discord webhook returned HTTP {resp.status}")
 
 
 def send_discord_webhook(

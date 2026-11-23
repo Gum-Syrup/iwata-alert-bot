@@ -8,9 +8,15 @@ import os
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
-from notifier import build_morning_embeds, build_prerace_embed, send_discord_webhook
+from notifier import (
+    build_gemini_research_prompt,
+    build_morning_embeds,
+    build_prerace_embed,
+    send_discord_text,
+    send_discord_webhook,
+)
 from rules import AlertDecision, evaluate_entry
 from scraper import (
     MiraiEntry,
@@ -18,6 +24,7 @@ from scraper import (
     fetch_horse_history,
     fetch_live_odds,
     fetch_mirai_entry_from_shutuba,
+    fetch_race_card_for_prompt,
 )
 
 JST = timezone(timedelta(hours=9))
@@ -65,7 +72,7 @@ def _save_sent_ids(state_path: Path, sent_ids: Set[str]) -> None:
     )
 
 
-def _enrich_entry(entry: MiraiEntry) -> None:
+def _enrich_entry(entry: MiraiEntry) -> Dict[int, Tuple[float, int]]:
     odds_map, odds_time = fetch_live_odds(entry.race_id)
     if entry.umaban in odds_map:
         entry.odds, entry.popularity = odds_map[entry.umaban]
@@ -73,6 +80,7 @@ def _enrich_entry(entry: MiraiEntry) -> None:
     time.sleep(0.2)
     entry.history = fetch_horse_history(entry.horse_id, entry.venue, entry.date)
     time.sleep(0.2)
+    return odds_map
 
 
 def run_morning(date_yyyymmdd: str, webhook_url: str, dry_run: bool) -> int:
@@ -153,7 +161,7 @@ def run_pre_race(
         if entry is None:
             continue
 
-        _enrich_entry(entry)
+        odds_map = _enrich_entry(entry)
         decision = evaluate_entry(entry, is_morning=False)
         print(
             f"  -> {entry.venue}{entry.race_num}R {entry.surface}{entry.distance}({entry.baba}) "
@@ -170,6 +178,18 @@ def run_pre_race(
             )
             embed = build_prerace_embed(decision, minutes_left=mins if (mins is not None and mins > 0) else None)
             send_discord_webhook(webhook_url, content, [embed], dry_run=dry_run)
+            time.sleep(0.5)
+
+            # Follow up with a 1-tap copyable Gemini (Neon Extra) research prompt containing full field + past runs
+            try:
+                runners = fetch_race_card_for_prompt(entry.race_id, odds_map)
+                if runners:
+                    prompt_body = build_gemini_research_prompt(decision, runners, max_chars=1910)
+                    prompt_msg = f"📋 **Gemini（Neon Extra）コピペ用・相手馬リサーチプロンプト**\n```text\n{prompt_body}\n```"
+                    send_discord_text(webhook_url, prompt_msg, dry_run=dry_run)
+            except Exception as exc:
+                print(f"  [warn] Failed to build/send Gemini prompt for {entry.race_id}: {exc}")
+
             sent_ids.add(s.race_id)
             alerts_sent += 1
             time.sleep(0.5)
