@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import urllib.request
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
+from prompt_template import GEM_MASTER_INSTRUCTIONS
 from rules import AlertDecision
 from scraper import RivalHorse
 
@@ -171,74 +173,105 @@ def build_morning_embeds(
     return content, embeds
 
 
-def build_gemini_research_prompt(
+def _format_step1_and_step2_data(
     decision: AlertDecision,
     runners: List[RivalHorse],
-    max_chars: int = 1920,
+    max_runs: int,
+    include_agari: bool,
 ) -> str:
-    """Build a 1-tap copy-paste prompt for Gemini (Neon Extra) that ALWAYS fits in 1 Discord message."""
     e = decision.entry
     date_fmt = f"{e.date[:4]}/{e.date[4:6]}/{e.date[6:8]}"
     surf_name = "ダート" if e.surface == "ダ" else "芝"
     baba_str = e.baba or "未発表"
-    odds_str = f"{e.popularity}人気/{e.odds:.1f}倍" if (e.popularity and e.odds) else "未確定"
     rank_label = "Sランク" if decision.rank == "S" else "Aランク"
     short_boosts = " / ".join(b.split("（")[0] for b in decision.boosts[:5])
 
     header = (
-        f"以下のJRAレースで岩田望来騎乗【{e.umaban}番 {e.horse_name}（{odds_str}）】を軸に馬券を組みます。\n"
-        "Web検索で当日の馬場傾向・調教・直前情報も補完しつつ、展開予想と望来の相手馬"
-        "（○対抗・▲単穴・△連下2〜3頭・☆穴1頭）を根拠つきで厳選し、馬連・ワイド・3連複の買い目案を簡潔に出してください。\n\n"
-        f"■レース：{date_fmt} {e.venue}{e.race_num}R {e.race_name} {surf_name}{e.distance}m({baba_str}) {e.race_class} {e.field_size}頭 {e.post_time}発走\n"
-        f"■望来判定：{rank_label}（{decision.pillar}｜{short_boosts}）\n"
-        f"■出馬表：{e.shutuba_url}\n"
-        "■全出走馬（馬番 馬名 性齢/騎手/斤量/人気・単勝/脚質｜近走）\n"
+        f"【対象レース：{date_fmt} {e.venue}{e.race_num}R {e.race_name}】\n"
+        f"条件：{surf_name}{e.distance}m({baba_str}) / {e.race_class} / {e.field_size}頭 / {e.post_time}発走\n"
+        f"出馬表：{e.shutuba_url}\n"
+        f"【岩田望来Bot判定（Step 2以降で優先検討）】{rank_label}：{e.umaban}番 {e.horse_name}（{decision.pillar}｜{short_boosts}）\n\n"
+        "■Step 1用：全出走馬データ（オッズ伏せ｜枠-馬番 馬名 性齢/騎手/斤量/脚質｜近走）\n"
     )
 
-    def _format_runners(max_runs: int, include_agari: bool) -> str:
-        lines: List[str] = []
-        for r in runners:
-            mark = "★" if r.umaban == e.umaban else ""
-            op_s = f"{r.popularity}人{r.odds:.1f}" if (r.popularity and r.odds) else "-"
-            st_s = f"/{r.style}" if r.style else ""
-            wt_s = r.kinryo.rstrip("0").rstrip(".") if r.kinryo else ""
-            meta = f"{r.sex_age}/{r.jockey}/{wt_s}/{op_s}{st_s}"
-            runs_s = []
-            for pr in r.past_runs[:max_runs]:
-                v = VENUE_SHORT.get(pr.venue, pr.venue[:1])
-                d = f"{pr.surface}{pr.distance // 100}" if pr.distance else ""
-                rk = f"{pr.rank}着" if pr.rank.isdigit() else pr.rank
-                mg = f"({pr.margin})" if pr.margin else ""
-                extras = []
-                if pr.tsuka:
-                    extras.append(pr.tsuka)
-                if include_agari and pr.agari:
-                    extras.append(f"上{pr.agari}")
-                ex_s = f"[{'/'.join(extras)}]" if extras else ""
-                runs_s.append(f"{v}{d}{pr.baba}{rk}{mg}{ex_s}")
-            past_txt = " ".join(runs_s) if runs_s else "初出走"
-            lines.append(f"{mark}{r.umaban} {r.horse_name}({meta}) {past_txt}")
-        return header + "\n".join(lines)
+    step1_lines: List[str] = []
+    odds_parts: List[str] = []
+    for r in runners:
+        st_s = f"/{r.style}" if r.style else ""
+        wt_s = r.kinryo.rstrip("0").rstrip(".") if r.kinryo else ""
+        meta = f"{r.sex_age}/{r.jockey}/{wt_s}{st_s}"
+        runs_s = []
+        for pr in r.past_runs[:max_runs]:
+            v = VENUE_SHORT.get(pr.venue, pr.venue[:1])
+            d = f"{pr.surface}{pr.distance // 100}" if pr.distance else ""
+            rk = f"{pr.rank}着" if pr.rank.isdigit() else pr.rank
+            mg = f"({pr.margin})" if pr.margin else ""
+            extras = []
+            if pr.tsuka:
+                extras.append(pr.tsuka)
+            if include_agari and pr.agari:
+                extras.append(f"上{pr.agari}")
+            ex_s = f"[{'/'.join(extras)}]" if extras else ""
+            runs_s.append(f"{v}{d}{pr.baba}{rk}{mg}{ex_s}")
+        past_txt = " ".join(runs_s) if runs_s else "初出走"
+        step1_lines.append(f"{r.waku}-{r.umaban} {r.horse_name}({meta}) {past_txt}")
 
-    # Progressively tighten detail if field is large so it NEVER exceeds Discord's 2000-char limit
+        if r.popularity and r.odds:
+            mark = "★" if r.umaban == e.umaban else ""
+            odds_parts.append(f"{mark}{r.umaban}番:{r.popularity}人({r.odds:.1f})")
+
+    step2_block = (
+        "\n\n■Step 2用：直前単勝オッズ（Step 1完了後に参照｜★＝岩田望来）\n"
+        + (" / ".join(odds_parts) if odds_parts else "オッズ未確定（Web検索で確認）")
+    )
+    return header + "\n".join(step1_lines) + step2_block
+
+
+def build_gemini_research_prompt(
+    decision: AlertDecision,
+    runners: List[RivalHorse],
+    max_chars: int = 1900,
+) -> str:
+    """Build a 1-tap copy-paste data block for the user's custom Gem (always fits in 1 Discord block)."""
     for max_runs, inc_agari in ((3, True), (3, False), (2, True), (2, False), (1, False)):
-        candidate = _format_runners(max_runs, inc_agari)
+        candidate = _format_step1_and_step2_data(decision, runners, max_runs, inc_agari)
         if len(candidate) <= max_chars:
             return candidate
+    return _format_step1_and_step2_data(decision, runners, 1, False)[:max_chars]
 
-    return _format_runners(1, False)[:max_chars]
+
+def build_full_prompt_txt(
+    decision: AlertDecision,
+    runners: List[RivalHorse],
+) -> str:
+    """Build the complete self-contained full prompt (.txt attachment) with all 3 past runs + agari."""
+    data_block = _format_step1_and_step2_data(decision, runners, max_runs=3, include_agari=True)
+    return (
+        GEM_MASTER_INSTRUCTIONS.strip()
+        + "\n\n"
+        + "=" * 60
+        + "\n# 今回分析する対象レースデータ\n"
+        + "=" * 60
+        + "\n"
+        + data_block
+        + "\n"
+    )
 
 
 def send_discord_text(
     webhook_url: str,
     content: str,
     dry_run: bool = False,
+    attachment_filename: Optional[str] = None,
+    attachment_text: Optional[str] = None,
 ) -> None:
-    """Send a plain-text / code-block message (no @everyone) to Discord."""
+    """Send a plain-text / code-block message (optionally with a .txt file attachment) to Discord."""
     if dry_run:
         print("-" * 72)
-        print(f"[DRY-RUN COPY-PASTE PROMPT] (len={len(content)})")
+        print(f"[DRY-RUN GEM COPY-PASTE BLOCK] (len={len(content)})")
         print(content)
+        if attachment_filename and attachment_text:
+            print(f"[DRY-RUN ATTACHMENT] {attachment_filename} ({len(attachment_text)} chars)")
         print("-" * 72)
         return
 
@@ -249,17 +282,47 @@ def send_discord_text(
         "content": content[:2000],
         "allowed_mentions": {"parse": []},
     }
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    if attachment_filename and attachment_text is not None:
+        boundary = f"----IwataBotBoundary{uuid.uuid4().hex}"
+        parts: List[bytes] = []
+        # payload_json part
+        parts.append(
+            (
+                f"--{boundary}\r\n"
+                'Content-Disposition: form-data; name="payload_json"\r\n'
+                "Content-Type: application/json; charset=utf-8\r\n\r\n"
+                f"{json.dumps(payload, ensure_ascii=False)}\r\n"
+            ).encode("utf-8")
+        )
+        # file part
+        file_bytes = attachment_text.encode("utf-8")
+        parts.append(
+            (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="files[0]"; filename="{attachment_filename}"\r\n'
+                "Content-Type: text/plain; charset=utf-8\r\n\r\n"
+            ).encode("utf-8")
+            + file_bytes
+            + b"\r\n"
+        )
+        parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+        body = b"".join(parts)
+        content_type = f"multipart/form-data; boundary={boundary}"
+    else:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        content_type = "application/json"
+
     req = urllib.request.Request(
         webhook_url,
         data=body,
         headers={
-            "Content-Type": "application/json",
+            "Content-Type": content_type,
             "User-Agent": "iwata-alert-bot/1.0",
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    with urllib.request.urlopen(req, timeout=25) as resp:
         if resp.status not in (200, 204):
             raise RuntimeError(f"Discord webhook returned HTTP {resp.status}")
 

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 from notifier import (
+    build_full_prompt_txt,
     build_gemini_research_prompt,
     build_morning_embeds,
     build_prerace_embed,
@@ -180,13 +181,26 @@ def run_pre_race(
             send_discord_webhook(webhook_url, content, [embed], dry_run=dry_run)
             time.sleep(0.5)
 
-            # Follow up with a 1-tap copyable Gemini (Neon Extra) research prompt containing full field + past runs
+            # Follow up with:
+            # 1) 1-tap copyable data block (for custom Gem with master instructions already saved)
+            # 2) Full self-contained .txt prompt attachment (for normal Gemini chat / Antigravity)
             try:
                 runners = fetch_race_card_for_prompt(entry.race_id, odds_map)
                 if runners:
-                    prompt_body = build_gemini_research_prompt(decision, runners, max_chars=1910)
-                    prompt_msg = f"📋 **Gemini（Neon Extra）コピペ用・相手馬リサーチプロンプト**\n```text\n{prompt_body}\n```"
-                    send_discord_text(webhook_url, prompt_msg, dry_run=dry_run)
+                    gem_body = build_gemini_research_prompt(decision, runners, max_chars=1880)
+                    full_txt = build_full_prompt_txt(decision, runners)
+                    filename = f"prompt_{entry.date}_{entry.venue}{entry.race_num}R.txt"
+                    prompt_msg = (
+                        "📋 **専用Gem（Neon Extra）コピペ用データ**（通常チャット用フルプロンプト `.txt` 添付済み）\n"
+                        f"```text\n{gem_body}\n```"
+                    )
+                    send_discord_text(
+                        webhook_url,
+                        prompt_msg,
+                        dry_run=dry_run,
+                        attachment_filename=filename,
+                        attachment_text=full_txt,
+                    )
             except Exception as exc:
                 print(f"  [warn] Failed to build/send Gemini prompt for {entry.race_id}: {exc}")
 
