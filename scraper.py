@@ -231,7 +231,11 @@ def fetch_day_races(date_yyyymmdd: str) -> List[RaceSummary]:
     return results
 
 
-def _parse_race_class(race_name_raw_html: str, race_data02_text: str) -> str:
+def _parse_race_class(
+    race_name_raw_html: str,
+    race_data02_text: str,
+    fallback_race_name: str = "",
+) -> str:
     """Accurately classify JRA race class from shutuba.html RaceName + RaceData02."""
     d2 = (
         race_data02_text.replace("１", "1")
@@ -258,6 +262,24 @@ def _parse_race_class(race_name_raw_html: str, race_data02_text: str) -> str:
         return "重賞"
     if "オープン" in d2 or re.search(r"Icon_GradeType(5|15)\b", race_name_raw_html):
         return "OP/L"
+
+    # Fallback: check normalized race title when RaceData02 omits class labels
+    title_norm = (
+        (_strip_tags(race_name_raw_html) + " " + fallback_race_name)
+        .replace("１", "1")
+        .replace("２", "2")
+        .replace("３", "3")
+    )
+    if "新馬" in title_norm:
+        return "新馬"
+    if "未勝利" in title_norm:
+        return "未勝利"
+    if "1勝クラス" in title_norm:
+        return "1勝クラス"
+    if "2勝クラス" in title_norm:
+        return "2勝クラス"
+    if "3勝クラス" in title_norm:
+        return "3勝クラス"
     return "その他"
 
 
@@ -280,7 +302,7 @@ def fetch_mirai_entry_from_shutuba(summary: RaceSummary, date_yyyymmdd: str) -> 
     d2_m = re.search(r'class="RaceData02"[^>]*>(.*?)</div>', text, re.S)
     d2_txt = _strip_tags(d2_m.group(1)) if d2_m else ""
 
-    race_class = _parse_race_class(rn_raw, d2_txt)
+    race_class = _parse_race_class(rn_raw, d2_txt, summary.race_name)
 
     # Post time
     post_time = summary.post_time
